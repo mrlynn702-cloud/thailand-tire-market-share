@@ -8,6 +8,15 @@ import GpsPicker from '@/components/GpsPicker';
 
 type Tier = { id: string; code: string; label: string };
 type Brand = { id: string; name: string };
+type Category = 'tire' | 'tube';
+
+// per-category state: how many units sold, and % share per selected brand
+type CategoryState = {
+  quantitySold: string; // keep as string for controlled input, parse on submit
+  shares: Record<string, string>; // brand_id -> percentage string
+};
+
+const emptyCategoryState = (): CategoryState => ({ quantitySold: '', shares: {} });
 
 export default function EntryPage() {
   const supabase = createClient();
@@ -22,9 +31,11 @@ export default function EntryPage() {
   const [tierId, setTierId] = useState('');
   const [lat, setLat] = useState<number | null>(null);
   const [lng, setLng] = useState<number | null>(null);
-  const [selectedBrands, setSelectedBrands] = useState<string[]>([]);
   const [photoFile, setPhotoFile] = useState<File | null>(null);
   const [notes, setNotes] = useState('');
+
+  const [tire, setTire] = useState<CategoryState>(emptyCategoryState());
+  const [tube, setTube] = useState<CategoryState>(emptyCategoryState());
 
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -38,8 +49,26 @@ export default function EntryPage() {
     });
   }, []);
 
-  function toggleBrand(id: string) {
-    setSelectedBrands((prev) => (prev.includes(id) ? prev.filter((b) => b !== id) : [...prev, id]));
+  function toggleBrandInCategory(cat: Category, brandId: string) {
+    const setter = cat === 'tire' ? setTire : setTube;
+    setter((prev) => {
+      const next = { ...prev.shares };
+      if (brandId in next) {
+        delete next[brandId];
+      } else {
+        next[brandId] = '';
+      }
+      return { ...prev, shares: next };
+    });
+  }
+
+  function setBrandPercentage(cat: Category, brandId: string, value: string) {
+    const setter = cat === 'tire' ? setTire : setTube;
+    setter((prev) => ({ ...prev, shares: { ...prev.shares, [brandId]: value } }));
+  }
+
+  function totalPercent(cat: CategoryState) {
+    return Object.values(cat.shares).reduce((sum, v) => sum + (parseFloat(v) || 0), 0);
   }
 
   async function handleSubmit(e: React.FormEvent) {
@@ -82,15 +111,40 @@ export default function EntryPage() {
         .select('id')
         .single();
       if (insertErr) throw insertErr;
+      const storeId = store!.id;
 
-      // 3. link brand suppliers
-      if (selectedBrands.length > 0 && store) {
-        const rows = selectedBrands.map((brand_id) => ({ store_id: store.id, brand_id }));
-        const { error: linkErr } = await supabase.from('store_brands').insert(rows);
-        if (linkErr) throw linkErr;
+      // 3. units sold per category (only insert if a quantity was entered)
+      const categorySalesRows = (['tire', 'tube'] as Category[])
+        .map((cat) => ({ cat, state: cat === 'tire' ? tire : tube }))
+        .filter(({ state }) => state.quantitySold !== '')
+        .map(({ cat, state }) => ({
+          store_id: storeId,
+          category: cat,
+          quantity_sold: parseInt(state.quantitySold, 10) || 0,
+        }));
+      if (categorySalesRows.length > 0) {
+        const { error: salesErr } = await supabase.from('store_category_sales').insert(categorySalesRows);
+        if (salesErr) throw salesErr;
       }
 
-      router.push(`/stores/${store!.id}`);
+      // 4. brand % shares per category (only rows where a % was actually entered)
+      const shareRows = (['tire', 'tube'] as Category[]).flatMap((cat) => {
+        const state = cat === 'tire' ? tire : tube;
+        return Object.entries(state.shares)
+          .filter(([, pct]) => pct !== '')
+          .map(([brandId, pct]) => ({
+            store_id: storeId,
+            brand_id: brandId,
+            category: cat,
+            percentage: parseFloat(pct) || 0,
+          }));
+      });
+      if (shareRows.length > 0) {
+        const { error: shareErr } = await supabase.from('store_brand_shares').insert(shareRows);
+        if (shareErr) throw shareErr;
+      }
+
+      router.push(`/stores/${storeId}`);
     } catch (err: any) {
       setError(err.message ?? 'Something went wrong.');
     } finally {
@@ -150,25 +204,27 @@ export default function EntryPage() {
           </select>
         </div>
 
-        <div>
-          <label className="text-sm text-gray-600 block mb-2">Brand suppliers (select all that apply)</label>
-          <div className="flex flex-wrap gap-2">
-            {brands.map((b) => (
-              <button
-                type="button"
-                key={b.id}
-                onClick={() => toggleBrand(b.id)}
-                className={`text-sm rounded-full px-3 py-1.5 border ${
-                  selectedBrands.includes(b.id)
-                    ? 'bg-black text-white border-black'
-                    : 'bg-white text-gray-700'
-                }`}
-              >
-                {b.name}
-              </button>
-            ))}
-          </div>
-        </div>
+        <CategorySection
+          title="🛞 ยางนอก (Tire)"
+          category="tire"
+          state={tire}
+          brands={brands}
+          onQuantityChange={(v) => setTire((p) => ({ ...p, quantitySold: v }))}
+          onToggleBrand={(id) => toggleBrandInCategory('tire', id)}
+          onPercentChange={(id, v) => setBrandPercentage('tire', id, v)}
+          total={totalPercent(tire)}
+        />
+
+        <CategorySection
+          title="⭕ ยางใน (Tube)"
+          category="tube"
+          state={tube}
+          brands={brands}
+          onQuantityChange={(v) => setTube((p) => ({ ...p, quantitySold: v }))}
+          onToggleBrand={(id) => toggleBrandInCategory('tube', id)}
+          onPercentChange={(id, v) => setBrandPercentage('tube', id, v)}
+          total={totalPercent(tube)}
+        />
 
         <div>
           <label className="text-sm text-gray-600 block mb-1">Notes (optional)</label>
@@ -186,6 +242,92 @@ export default function EntryPage() {
           {saving ? 'Saving…' : 'Save store'}
         </button>
       </form>
+    </div>
+  );
+}
+
+function CategorySection({
+  title,
+  state,
+  brands,
+  onQuantityChange,
+  onToggleBrand,
+  onPercentChange,
+  total,
+}: {
+  title: string;
+  category: Category;
+  state: CategoryState;
+  brands: Brand[];
+  onQuantityChange: (v: string) => void;
+  onToggleBrand: (brandId: string) => void;
+  onPercentChange: (brandId: string, v: string) => void;
+  total: number;
+}) {
+  const selectedIds = Object.keys(state.shares);
+
+  return (
+    <div className="border rounded-lg p-4 bg-gray-50">
+      <h2 className="font-medium mb-3">{title}</h2>
+
+      <div className="mb-3">
+        <label className="text-sm text-gray-600 block mb-1">ยอดขาย (เส้น)</label>
+        <input
+          type="number"
+          min={0}
+          placeholder="เช่น 120"
+          value={state.quantitySold}
+          onChange={(e) => onQuantityChange(e.target.value)}
+          className="w-full sm:w-48 border rounded px-3 py-2"
+        />
+      </div>
+
+      <div>
+        <label className="text-sm text-gray-600 block mb-2">แบรนด์ที่ขาย และสัดส่วน %</label>
+        <div className="flex flex-wrap gap-2 mb-3">
+          {brands.map((b) => (
+            <button
+              type="button"
+              key={b.id}
+              onClick={() => onToggleBrand(b.id)}
+              className={`text-sm rounded-full px-3 py-1.5 border ${
+                selectedIds.includes(b.id)
+                  ? 'bg-black text-white border-black'
+                  : 'bg-white text-gray-700'
+              }`}
+            >
+              {b.name}
+            </button>
+          ))}
+        </div>
+
+        {selectedIds.length > 0 && (
+          <div className="space-y-2">
+            {selectedIds.map((brandId) => {
+              const brand = brands.find((b) => b.id === brandId);
+              return (
+                <div key={brandId} className="flex items-center gap-2">
+                  <span className="text-sm w-28 truncate">{brand?.name}</span>
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step="0.1"
+                    placeholder="%"
+                    value={state.shares[brandId]}
+                    onChange={(e) => onPercentChange(brandId, e.target.value)}
+                    className="w-24 border rounded px-2 py-1 text-sm"
+                  />
+                  <span className="text-sm text-gray-500">%</span>
+                </div>
+              );
+            })}
+            <p className={`text-xs ${total > 100 ? 'text-red-600' : 'text-gray-500'}`}>
+              รวม {total.toFixed(1)}% {total > 100 && '(เกิน 100% — เช็คตัวเลขอีกที)'}
+            </p>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
